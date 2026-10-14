@@ -65,6 +65,7 @@ input[type=text]:focus{border-color:var(--a);box-shadow:0 0 0 3px #6c8cff33}
 .tr.done .bar i{background:var(--ok);animation:none}
 .tr.fail .bar i{background:var(--err);animation:none}
 footer{text-align:center;padding:10px 0 28px;color:var(--mut);font-size:13px;letter-spacing:.5px}footer b{background:linear-gradient(90deg,var(--a),var(--b),#00d4c8);-webkit-background-clip:text;background-clip:text;color:transparent}
+.x{border:0;background:rgba(255,92,122,.18);color:#ff8fa5;border-radius:10px;padding:5px 10px;cursor:pointer;font-size:12px;font-weight:700;transition:.2s}.x:hover{background:var(--err);color:#fff}
 #toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,120px);background:#151c36;border:1px solid var(--bd);padding:12px 20px;border-radius:14px;transition:.35s;z-index:99;max-width:90vw}
 #toast.show{transform:translate(-50%,0)}
 #cam{position:fixed;inset:0;background:#000d;z-index:50;display:none;place-items:center;backdrop-filter:blur(8px)}
@@ -127,7 +128,7 @@ footer{text-align:center;padding:10px 0 28px;color:var(--mut);font-size:13px;let
 
 <script>
 const $=id=>document.getElementById(id);
-const CH=16*1024, HIGH=8*1024*1024;
+const HIGH=6*1024*1024,LOW=2*1024*1024,BLOCK=8*1024*1024,FLUSH=4*1024*1024;
 const AL='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const ua=navigator.userAgent;
 const kind=/iPhone|Android.+Mobile/i.test(ua)?'📱':/iPad|Tablet/i.test(ua)?'📲':'💻';
@@ -208,82 +209,119 @@ function onData(conn,d){
     }else if(m.t==='new')tryMesh(m.id);
     else if(m.t==='meta')rxStart(conn,m);
     else if(m.t==='end')rxEnd(conn,m.id);
+    else if(m.t==='cancel')rxAbort(conn,m.id,'Cancelled by sender',false);
+    else if(m.t==='stop'){const s=tr[m.id];if(s&&!s.done){s.cancelled=true;fail(m.id,'Cancelled by receiver')}}
     return;
   }
   const r=conn._rx;if(!r)return;
   r.got+=d.byteLength;
-  if(r.w){r.chain=r.chain.then(()=>r.w.write(d))}else r.parts.push(d);
+  if(r.dir){r.buf.push(d);r.bs+=d.byteLength;if(r.bs>=FLUSH)flush(r)}else r.parts.push(d);
   upd(r.id,r.got,r.size);
 }
-async function uniqueHandle(name){
+function flush(r){if(!r.buf.length)return;const b=new Blob(r.buf);r.buf=[];r.bs=0;r.chain=r.chain.then(()=>r.w.write(b))}
+async function uniqueHandle(dh,name){
   let n=name,i=0;
   while(true){
-    try{await dirH.getFileHandle(n);i++;const dot=name.lastIndexOf('.');n=dot>0?name.slice(0,dot)+' ('+i+')'+name.slice(dot):name+' ('+i+')'}
-    catch(e){return dirH.getFileHandle(n,{create:true})}
+    try{await dh.getFileHandle(n);i++;const dot=name.lastIndexOf('.');n=dot>0?name.slice(0,dot)+' ('+i+')'+name.slice(dot):name+' ('+i+')'}
+    catch(e){return dh.getFileHandle(n,{create:true})}
   }
 }
 function rxStart(conn,m){
-  const r={id:m.id,name:m.name,size:m.size,got:0,parts:[],w:null,chain:Promise.resolve(),type:m.type};
-  conn._rx=r;addTr(m.id,'⬇️',m.name,m.size,peers.get(conn.peer)?.name||'');
-  if(dirH){r.chain=(async()=>{r.w=await(await uniqueHandle(m.name)).createWritable()})()}
+  const r={id:m.id,name:m.name,size:m.size,got:0,parts:[],buf:[],bs:0,dir:!!dirH,dh:dirH,w:null,h:null,chain:Promise.resolve(),type:m.type};
+  conn._rx=r;
+  addTr(m.id,'⬇️',m.name,m.size,peers.get(conn.peer)?.name||'',()=>rxAbort(conn,m.id,'Cancelled',true));
+  if(r.dir)r.chain=(async()=>{r.h=await uniqueHandle(r.dh,m.name);r.w=await r.h.createWritable()})();
+}
+async function rxAbort(conn,id,msg,notify){
+  const r=conn._rx;if(!r||r.id!==id)return;conn._rx=null;
+  if(notify){try{conn.send(JSON.stringify({t:'stop',id}))}catch(e){}}
+  fail(id,msg);
+  try{await r.chain.catch(()=>{});if(r.w){await r.w.abort().catch(()=>{});await r.dh.removeEntry(r.h.name).catch(()=>{})}}catch(e){}
+  r.parts=[];r.buf=[];
 }
 async function rxEnd(conn,id){
   const r=conn._rx;if(!r||r.id!==id)return;conn._rx=null;
   try{
-    await r.chain;
-    if(r.w){await r.w.close();r.saved='Saved to folder ✅'}
+    if(r.dir){flush(r);await r.chain;await r.w.close();r.saved='Saved to folder ✅'}
     else{
       const url=URL.createObjectURL(new Blob(r.parts,{type:r.type||'application/octet-stream'}));
       const a=document.createElement('a');a.href=url;a.download=r.name;document.body.appendChild(a);a.click();a.remove();
-      setTimeout(()=>URL.revokeObjectURL(url),60000);r.saved='Downloaded ✅';
+      setTimeout(()=>URL.revokeObjectURL(url),60000);r.saved='Downloaded ✅';r.parts=[];
     }
-    finish(id,r.saved);toast('📥 Received: '+r.name);
+    upd(id,r.size,r.size,true);finish(id,r.saved);toast('📥 Received: '+r.name);
   }catch(e){fail(id,'Save error: '+e.message)}
 }
 
 /* ---------- Send ---------- */
+const drain=dc=>new Promise(res=>{
+  const f=()=>{dc.removeEventListener('bufferedamountlow',f);clearTimeout(t);res()};
+  dc.addEventListener('bufferedamountlow',f);const t=setTimeout(f,150);
+});
 function sendFiles(files){
   const targets=[...peers.values()].filter(p=>p.sel);
   if(!targets.length)return toast('Connect and select a device first');
   for(const f of files)for(const p of targets){
-    p.q=p.q.then(()=>sendOne(p,f)).catch(()=>{});
+    const id=rid();
+    addTr(id,'⬆️',f.name,f.size,p.name,()=>cancelSend(p,id),'Waiting…');
+    p.q=p.q.then(()=>sendOne(p,f,id)).catch(()=>{});
   }
 }
-async function sendOne(p,f){
-  const id=rid(),c=p.conn,dc=c.dataChannel;
-  addTr(id,'⬆️',f.name,f.size,p.name);
+function cancelSend(p,id){
+  const s=tr[id];if(!s||s.done)return;
+  s.cancelled=true;
+  if(s.started){try{p.conn.send(JSON.stringify({t:'cancel',id}))}catch(e){}}
+  fail(id,'Cancelled');
+}
+async function sendOne(p,f,id){
+  const s=tr[id];if(!s||s.cancelled)return;
+  const c=p.conn,dc=c.dataChannel;
+  const CH=Math.min(262144,c.peerConnection?.sctp?.maxMessageSize||65536);
+  dc.bufferedAmountLowThreshold=LOW;
+  s.started=true;
   try{
     c.send(JSON.stringify({t:'meta',id,name:f.name,size:f.size,type:f.type}));
-    let off=0;
+    let off=0,next=f.size?f.slice(0,BLOCK).arrayBuffer():null;
     while(off<f.size){
-      while(dc.bufferedAmount>HIGH){await sleep(15);if(dc.readyState!=='open')throw new Error('Disconnected')}
-      const buf=await f.slice(off,off+CH).arrayBuffer();
-      c.send(buf);off+=buf.byteLength;
-      if((off/CH)%32===0)upd(id,off,f.size);
+      const buf=await next,end=off+buf.byteLength;
+      next=end<f.size?f.slice(end,end+BLOCK).arrayBuffer():null;
+      for(let o=0;o<buf.byteLength;o+=CH){
+        if(s.cancelled)return;
+        if(dc.readyState!=='open')throw new Error('Disconnected');
+        if(dc.bufferedAmount>HIGH)await drain(dc);
+        if(s.cancelled)return;
+        const n=Math.min(CH,buf.byteLength-o);
+        c.send(new Uint8Array(buf,o,n));
+        upd(id,off+o+n,f.size);
+      }
+      off=end;
     }
-    while(dc.bufferedAmount>0){await sleep(30)}
+    while(dc.bufferedAmount>0&&!s.cancelled&&dc.readyState==='open')await sleep(20);
+    if(s.cancelled)return;
     c.send(JSON.stringify({t:'end',id}));
-    upd(id,f.size,f.size);finish(id,'Sent ✅');
-  }catch(e){fail(id,e.message||'Failed')}
+    upd(id,f.size,f.size,true);finish(id,'Sent ✅');
+  }catch(e){if(!s.cancelled)fail(id,e.message||'Failed')}
 }
 
 /* ---------- Transfer UI ---------- */
-function addTr(id,ic,name,size,who){
+function addTr(id,ic,name,size,who,onCancel,st){
   if($('list').querySelector('.empty'))$('list').innerHTML='';
   const d=document.createElement('div');d.className='tr';d.id='t'+id;
-  d.innerHTML='<div class="t"><span class="n"></span><b>'+ic+'</b></div><div class="bar"><i></i></div><div class="s"><span class="st">0%</span><span class="sz"></span></div>';
+  d.innerHTML='<div class="t"><span class="n"></span><span style="display:flex;gap:8px;align-items:center"><b>'+ic+'</b><button class="x">✖ Cancel</button></span></div><div class="bar"><i></i></div><div class="s"><span class="st">'+(st||'0%')+'</span><span class="sz"></span></div>';
   d.querySelector('.n').textContent=name+' • '+who;d.querySelector('.sz').textContent=fmt(size);
-  $('list').prepend(d);tr[id]={t:Date.now(),l:0,lt:Date.now()};
+  d.querySelector('.x').onclick=onCancel;
+  $('list').prepend(d);tr[id]={t:Date.now(),l:0,lt:Date.now(),ui:0};
 }
-function upd(id,got,size){
-  const e=$('t'+id);if(!e)return;const s=tr[id],now=Date.now();
+function upd(id,got,size,force){
+  const e=$('t'+id),s=tr[id];if(!e||!s||s.done)return;const now=Date.now();
+  if(!force&&now-s.ui<120)return;s.ui=now;
   e.querySelector('.bar i').style.width=(size?got/size*100:100)+'%';
   if(now-s.lt>400){const sp=(got-s.l)/((now-s.lt)/1000);s.l=got;s.lt=now;
     e.querySelector('.st').textContent=Math.floor(size?got/size*100:100)+'% • '+fmt(sp)+'/s'}
   e.querySelector('.sz').textContent=fmt(got)+' / '+fmt(size);
 }
-function finish(id,t){const e=$('t'+id);if(!e)return;e.classList.add('done');e.querySelector('.bar i').style.width='100%';e.querySelector('.st').textContent=t}
-function fail(id,t){const e=$('t'+id);if(!e)return;e.classList.add('fail');e.querySelector('.st').textContent='❌ '+t}
+function end(id,cls,t){const e=$('t'+id);if(!e)return;tr[id].done=true;e.classList.add(cls);e.querySelector('.x')?.remove();e.querySelector('.st').textContent=t}
+function finish(id,t){end(id,'done',t);const e=$('t'+id);if(e)e.querySelector('.bar i').style.width='100%'}
+function fail(id,t){end(id,'fail','❌ '+t)}
 
 /* ---------- Folder ---------- */
 $('dirBtn').onclick=async()=>{
