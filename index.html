@@ -312,7 +312,7 @@ async function rxAbort(conn,id,msg,notify){
 async function rxEnd(conn,id){
   const pr=peers.get(conn.peer),r=pr&&pr.rx;if(!r||r.id!==id)return;
   if(r.got<r.size)await new Promise(res=>{r.ending=res;setTimeout(res,30000)});
-  if(pr.rx!==r)return;pr.rx=null;
+  if(pr.rx!==r)return;pr.rx=null;pr.last=Date.now();
   try{
     if(r.dir){flush(r);await r.chain;await r.w.close();r.saved='Saved to folder ✅'}
     else{
@@ -335,7 +335,8 @@ function sendFiles(files){
   for(const f of files)for(const p of targets){
     const id=rid();p.last=Date.now();
     addTr(id,'⬆️',f.name,f.size,p.name,()=>cancelSend(p,id),'Waiting…');
-    p.q=p.q.then(()=>sendOne(p,f,id)).catch(()=>{});
+    p.busy=(p.busy||0)+1;
+    p.q=p.q.then(()=>sendOne(p,f,id)).catch(()=>{}).then(()=>{p.busy--;p.last=Date.now()});
   }
 }
 function cancelSend(p,id){
@@ -419,6 +420,7 @@ $('discAll').onclick=()=>{[...peers.keys()].forEach(id=>dropPeer(id,true,'manual
 setInterval(()=>{
   const now=Date.now();
   [...peers.entries()].forEach(([id,p])=>{
+    if(p.busy>0||p.rx){p.last=now;return} // file sending/receiving in progress – never auto-disconnect
     if(now-(p.last||now)>IDLE){dropPeer(id,true,'idle');toast('⏱️ Inactive for 5 min – disconnected. Scan or enter code to connect again')}
   });
 },10000);
