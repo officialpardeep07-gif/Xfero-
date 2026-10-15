@@ -73,6 +73,7 @@ footer{text-align:center;padding:10px 0 28px;color:var(--mut);font-size:13px;let
 #cam .box{width:min(92vw,420px);text-align:center}
 #cam video{width:100%;border-radius:20px;border:2px solid var(--a)}
 .empty{color:var(--mut);font-size:13px;padding:6px}
+.dev .x{margin-left:4px;padding:4px 8px}
 </style>
 </head>
 <body>
@@ -102,6 +103,8 @@ footer{text-align:center;padding:10px 0 28px;color:var(--mut);font-size:13px;let
       <div class="radar"><div class="me" id="meIcon">💻</div></div>
       <div class="devs" id="devs"><div class="empty">No devices connected yet…</div></div>
       <div class="hint" style="margin-top:8px">Tap a device to select/deselect (green = will receive files)</div>
+      <button class="btn g" id="discAll" style="display:none;width:100%;margin-top:12px">🔌 Disconnect All</button>
+      <div class="hint" style="margin-top:8px">⏱️ Auto-disconnects after 5 min of inactivity</div>
     </div>
     <div class="card">
       <h2>📁 Receive Folder (Auto Save)</h2>
@@ -171,12 +174,36 @@ function start(){
   });
   peer.on('disconnected',()=>{$('status').textContent='Reconnecting…';$('dot').classList.remove('on');try{peer.reconnect()}catch(e){}});
 }
+const IDLE=5*60*1000;
+const alive=p=>!!(p&&p.conn&&p.conn.open&&p.conn.dataChannel&&p.conn.dataChannel.readyState==='open');
+function dropPeer(id,notify,reason){
+  const p=peers.get(id);if(!p)return;
+  if(p.rx){try{rxAbort(p.conn,p.rx.id,'Disconnected',false)}catch(e){}}
+  if(notify){try{p.conn.send(JSON.stringify({t:'bye',r:reason||''}))}catch(e){}}
+  peers.delete(id);pending.delete(id);
+  const lanes=p.lanes.slice();p.lanes=[];
+  setTimeout(()=>{lanes.forEach(l=>{try{l.close()}catch(e){}});try{p.conn.close()}catch(e){}},250);
+  renderDevs();
+}
 function connect(c){
   c=c.trim().toUpperCase();if(c.length!==6)return toast('Enter the 6-character code');
   if(c===code)return toast('This is your own code');
-  const id='wd'+c;if(peers.has(id)||pending.has(id))return toast('Already connected');
-  pending.add(id);setTimeout(()=>pending.delete(id),15000);toast('Connecting…');
-  setup(peer.connect(id,{reliable:true,serialization:'raw'}),true);
+  const id='wd'+c;
+  const ex=peers.get(id);
+  if(ex){
+    if(alive(ex))return toast('✅ Already connected to this device');
+    dropPeer(id,false); // stale/dead entry – clean it and reconnect
+  }
+  if(pending.has(id))return toast('⏳ Connecting… please wait');
+  pending.add(id);toast('Connecting…');
+  const conn=peer.connect(id,{reliable:true,serialization:'raw'});
+  const t=setTimeout(()=>{
+    if(pending.has(id)&&!peers.has(id)){pending.delete(id);try{conn.close()}catch(e){}toast('❌ Could not connect – try again')}
+  },15000);
+  conn.on('open',()=>clearTimeout(t));
+  conn.on('error',()=>{clearTimeout(t);pending.delete(id)});
+  conn.on('close',()=>{clearTimeout(t);pending.delete(id)});
+  setup(conn,true);
 }
 function addLane(c,tries){
   const p=peers.get(c.peer);
@@ -192,8 +219,9 @@ function setupLane(c){
 function setup(conn,out){
   conn.on('open',()=>{
     pending.delete(conn.peer);
-    if(peers.has(conn.peer)){conn.close();return}
-    peers.set(conn.peer,{conn,name:conn.peer,sel:true,q:Promise.resolve(),lanes:[],rx:null});
+    const ex=peers.get(conn.peer);
+    if(ex){if(alive(ex)&&ex.conn!==conn){conn.close();return}if(ex.conn!==conn)dropPeer(conn.peer,false)}
+    peers.set(conn.peer,{conn,name:conn.peer,sel:true,q:Promise.resolve(),lanes:[],rx:null,last:Date.now()});
     if(out)for(let i=0;i<LANES;i++)setupLane(peer.connect(conn.peer,{reliable:true,serialization:'raw',metadata:{lane:i}}));
     conn.send(JSON.stringify({t:'hi',name:myName,peers:[...peers.keys()].filter(k=>k!==conn.peer)}));
     renderDevs();wake();
@@ -210,9 +238,14 @@ function renderDevs(){
   const el=$('devs');el.innerHTML='';
   if(!peers.size)el.innerHTML='<div class="empty">No devices connected yet…</div>';
   peers.forEach((p,id)=>{
-    const d=document.createElement('div');d.className='dev'+(p.sel?' sel':'');d.textContent=p.name;
+    const d=document.createElement('div');d.className='dev'+(p.sel?' sel':'');
+    const nm=document.createElement('span');nm.textContent=p.name;d.appendChild(nm);
+    const x=document.createElement('button');x.className='x';x.textContent='✖ Disconnect';x.title='Disconnect this device';
+    x.onclick=e=>{e.stopPropagation();dropPeer(id,true,'manual');toast('🔌 Disconnected')};
+    d.appendChild(x);
     d.onclick=()=>{p.sel=!p.sel;renderDevs()};el.appendChild(d);
   });
+  $('discAll').style.display=peers.size?'flex':'none';
   $('cnt').textContent=peers.size?'('+peers.size+')':'';
   $('status').textContent=peers.size?peers.size+' device connected':'Online • Ready';
 }
@@ -220,13 +253,18 @@ function renderDevs(){
 /* ---------- Receive ---------- */
 function onData(conn,d){
   const p=peers.get(conn.peer);
+  if(p)p.last=Date.now();
   if(typeof d==='string'){
     const m=JSON.parse(d);
     if(m.t==='hi'){
       if(p){p.name=m.name;renderDevs();toast('✅ '+m.name+' connected')}
       m.peers.forEach(tryMesh);
       peers.forEach((q,id)=>{if(id!==conn.peer)q.conn.send(JSON.stringify({t:'new',id:conn.peer}))});
-    }else if(m.t==='new')tryMesh(m.id);
+    }else if(m.t==='bye'){
+      const nm=p?p.name:'Device';dropPeer(conn.peer,false);
+      toast(m.r==='idle'?'⏱️ Inactive for 5 min – disconnected. Scan or enter code to connect again':'🔌 '+nm+' disconnected');
+    }
+    else if(m.t==='new')tryMesh(m.id);
     else if(m.t==='meta')rxStart(conn,m);
     else if(m.t==='end')rxEnd(conn,m.id);
     else if(m.t==='cancel')rxAbort(conn,m.id,'Cancelled by sender',false);
@@ -295,7 +333,7 @@ function sendFiles(files){
   const targets=[...peers.values()].filter(p=>p.sel);
   if(!targets.length)return toast('Connect and select a device first');
   for(const f of files)for(const p of targets){
-    const id=rid();
+    const id=rid();p.last=Date.now();
     addTr(id,'⬆️',f.name,f.size,p.name,()=>cancelSend(p,id),'Waiting…');
     p.q=p.q.then(()=>sendOne(p,f,id)).catch(()=>{});
   }
@@ -309,6 +347,7 @@ function cancelSend(p,id){
 async function sendOne(p,f,id){
   const s=tr[id];if(!s||s.cancelled)return;
   const c=p.conn;
+  if(peers.get(c.peer)!==p){fail(id,'Disconnected');return}
   const lanes=()=>[c,...p.lanes].filter(x=>x.dataChannel&&x.dataChannel.readyState==='open');
   const CH=Math.min(262144,c.peerConnection?.sctp?.maxMessageSize||65536)-HDR;
   const n=Math.floor(Math.random()*4294967295);
@@ -330,7 +369,7 @@ async function sendOne(p,f,id){
         const pkt=new Uint8Array(HDR+m);
         const dv=new DataView(pkt.buffer);dv.setUint32(0,n);dv.setFloat64(4,off+o);
         pkt.set(new Uint8Array(buf,o,m),HDR);
-        best.send(pkt);
+        best.send(pkt);p.last=Date.now();
         upd(id,off+o+m,f.size);
       }
       off=end;
@@ -376,6 +415,13 @@ if(!window.showDirectoryPicker)$('dirInfo').textContent='Files save to Downloads
 
 /* ---------- Inputs ---------- */
 $('goBtn').onclick=()=>connect($('join').value);
+$('discAll').onclick=()=>{[...peers.keys()].forEach(id=>dropPeer(id,true,'manual'));toast('🔌 All devices disconnected')};
+setInterval(()=>{
+  const now=Date.now();
+  [...peers.entries()].forEach(([id,p])=>{
+    if(now-(p.last||now)>IDLE){dropPeer(id,true,'idle');toast('⏱️ Inactive for 5 min – disconnected. Scan or enter code to connect again')}
+  });
+},10000);
 $('join').addEventListener('keydown',e=>{if(e.key==='Enter')connect($('join').value)});
 $('join').addEventListener('input',e=>{if(e.target.value.length===6)connect(e.target.value)});
 $('code').onclick=()=>{navigator.clipboard?.writeText(code);toast('Code copied')};
