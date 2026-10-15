@@ -128,12 +128,13 @@ footer{text-align:center;padding:10px 0 28px;color:var(--mut);font-size:13px;let
 
 <script>
 const $=id=>document.getElementById(id);
-const HIGH=6*1024*1024,LOW=2*1024*1024,BLOCK=8*1024*1024,FLUSH=4*1024*1024;
+const HIGH=8*1024*1024,LOW=2*1024*1024,BLOCK=16*1024*1024,FLUSH=16*1024*1024,LANES=3,HDR=12;
 const AL='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const ua=navigator.userAgent;
 const kind=/iPhone|Android.+Mobile/i.test(ua)?'📱':/iPad|Tablet/i.test(ua)?'📲':'💻';
 const myName=kind+' '+(/Android/.test(ua)?'Android':/iPhone|iPad/.test(ua)?'iOS':/Mac/.test(ua)?'Mac':/Windows/.test(ua)?'Windows':'Device')+'-'+Math.floor(10+Math.random()*90);
 let peer,code,dirH=null;
+try{localStorage.removeItem('wd_paired');localStorage.removeItem('wd_mycode')}catch(e){}
 const peers=new Map(); // id -> {conn,name,sel}
 const pending=new Set();
 const tr={};
@@ -155,10 +156,17 @@ function start(){
     const h=location.hash.match(/join=([A-Z0-9]{6})/i);
     if(h&&h[1].toUpperCase()!==code){connect(h[1].toUpperCase());history.replaceState(null,'',location.pathname)}
   });
-  peer.on('connection',setup);
+  peer.on('connection',c=>{
+    if(c.metadata&&c.metadata.lane!=null)return setupLane(c);
+    setup(c,false);
+  });
   peer.on('error',e=>{
     if(e.type==='unavailable-id'){start();return}
-    if(e.type==='peer-unavailable')toast('❌ This code is not online');
+    if(e.type==='peer-unavailable'){
+      const m=(e.message||'').match(/(wd[A-Z0-9]{6})/);
+      if(m)pending.delete(m[1]);
+      toast('❌ This code is not online');
+    }
     else toast('⚠️ '+e.type);
   });
   peer.on('disconnected',()=>{$('status').textContent='Reconnecting…';$('dot').classList.remove('on');try{peer.reconnect()}catch(e){}});
@@ -167,24 +175,36 @@ function connect(c){
   c=c.trim().toUpperCase();if(c.length!==6)return toast('Enter the 6-character code');
   if(c===code)return toast('This is your own code');
   const id='wd'+c;if(peers.has(id)||pending.has(id))return toast('Already connected');
-  pending.add(id);toast('Connecting…');
-  setup(peer.connect(id,{reliable:true,serialization:'raw'}));
+  pending.add(id);setTimeout(()=>pending.delete(id),15000);toast('Connecting…');
+  setup(peer.connect(id,{reliable:true,serialization:'raw'}),true);
 }
-function setup(conn){
+function addLane(c,tries){
+  const p=peers.get(c.peer);
+  if(!p){if(tries>0)setTimeout(()=>addLane(c,tries-1),300);else c.close();return}
+  p.lanes.push(c);
+}
+function setupLane(c){
+  c.on('open',()=>addLane(c,10));
+  c.on('data',d=>onData(c,d));
+  const rm=()=>{const p=peers.get(c.peer);if(p)p.lanes=p.lanes.filter(x=>x!==c)};
+  c.on('close',rm);c.on('error',rm);
+}
+function setup(conn,out){
   conn.on('open',()=>{
     pending.delete(conn.peer);
     if(peers.has(conn.peer)){conn.close();return}
-    peers.set(conn.peer,{conn,name:conn.peer,sel:true,q:Promise.resolve()});
+    peers.set(conn.peer,{conn,name:conn.peer,sel:true,q:Promise.resolve(),lanes:[],rx:null});
+    if(out)for(let i=0;i<LANES;i++)setupLane(peer.connect(conn.peer,{reliable:true,serialization:'raw',metadata:{lane:i}}));
     conn.send(JSON.stringify({t:'hi',name:myName,peers:[...peers.keys()].filter(k=>k!==conn.peer)}));
     renderDevs();wake();
   });
   conn.on('data',d=>onData(conn,d));
-  conn.on('close',()=>{pending.delete(conn.peer);if(peers.get(conn.peer)?.conn===conn){peers.delete(conn.peer);renderDevs()}});
+  conn.on('close',()=>{pending.delete(conn.peer);const pp=peers.get(conn.peer);if(pp?.conn===conn){pp.lanes.forEach(l=>{try{l.close()}catch(e){}});peers.delete(conn.peer);renderDevs()}});
   conn.on('error',()=>{pending.delete(conn.peer)});
 }
 function tryMesh(id){
   if(id===peer.id||peers.has(id)||pending.has(id))return;
-  if(peer.id>id){pending.add(id);setup(peer.connect(id,{reliable:true,serialization:'raw'}))}
+  if(peer.id>id){pending.add(id);setup(peer.connect(id,{reliable:true,serialization:'raw'}),true)}
 }
 function renderDevs(){
   const el=$('devs');el.innerHTML='';
@@ -213,12 +233,24 @@ function onData(conn,d){
     else if(m.t==='stop'){const s=tr[m.id];if(s&&!s.done){s.cancelled=true;fail(m.id,'Cancelled by receiver')}}
     return;
   }
-  const r=conn._rx;if(!r)return;
-  r.got+=d.byteLength;
-  if(r.dir){r.buf.push(d);r.bs+=d.byteLength;if(r.bs>=FLUSH)flush(r)}else r.parts.push(d);
+  const r=p&&p.rx;if(!r||!(d instanceof ArrayBuffer))return;
+  const dv=new DataView(d);if(dv.getUint32(0)!==r.n)return;
+  const o=dv.getFloat64(4),u=new Uint8Array(d,HDR);
+  r.got+=u.byteLength;
+  if(r.dir){r.buf.push({o,d:u});r.bs+=u.byteLength;if(r.bs>=FLUSH)flush(r)}else r.parts.push({o,d:u});
   upd(r.id,r.got,r.size);
+  if(r.ending&&r.got>=r.size)r.ending();
 }
-function flush(r){if(!r.buf.length)return;const b=new Blob(r.buf);r.buf=[];r.bs=0;r.chain=r.chain.then(()=>r.w.write(b))}
+function flush(r){
+  if(!r.buf.length)return;
+  const items=r.buf.sort((a,b)=>a.o-b.o);r.buf=[];r.bs=0;
+  const runs=[];let cur=null;
+  for(const it of items){
+    if(cur&&cur.end===it.o){cur.parts.push(it.d);cur.end+=it.d.byteLength}
+    else{cur={o:it.o,end:it.o+it.d.byteLength,parts:[it.d]};runs.push(cur)}
+  }
+  for(const run of runs){const b=new Blob(run.parts);r.chain=r.chain.then(()=>r.w.write({type:'write',position:run.o,data:b}))}
+}
 async function uniqueHandle(dh,name){
   let n=name,i=0;
   while(true){
@@ -227,24 +259,26 @@ async function uniqueHandle(dh,name){
   }
 }
 function rxStart(conn,m){
-  const r={id:m.id,name:m.name,size:m.size,got:0,parts:[],buf:[],bs:0,dir:!!dirH,dh:dirH,w:null,h:null,chain:Promise.resolve(),type:m.type};
-  conn._rx=r;
+  const r={id:m.id,n:m.n,name:m.name,size:m.size,got:0,parts:[],buf:[],bs:0,dir:!!dirH,dh:dirH,w:null,h:null,chain:Promise.resolve(),type:m.type};
+  const pr=peers.get(conn.peer);if(pr)pr.rx=r;
   addTr(m.id,'⬇️',m.name,m.size,peers.get(conn.peer)?.name||'',()=>rxAbort(conn,m.id,'Cancelled',true));
   if(r.dir)r.chain=(async()=>{r.h=await uniqueHandle(r.dh,m.name);r.w=await r.h.createWritable()})();
 }
 async function rxAbort(conn,id,msg,notify){
-  const r=conn._rx;if(!r||r.id!==id)return;conn._rx=null;
+  const pr=peers.get(conn.peer),r=pr&&pr.rx;if(!r||r.id!==id)return;pr.rx=null;
   if(notify){try{conn.send(JSON.stringify({t:'stop',id}))}catch(e){}}
   fail(id,msg);
   try{await r.chain.catch(()=>{});if(r.w){await r.w.abort().catch(()=>{});await r.dh.removeEntry(r.h.name).catch(()=>{})}}catch(e){}
   r.parts=[];r.buf=[];
 }
 async function rxEnd(conn,id){
-  const r=conn._rx;if(!r||r.id!==id)return;conn._rx=null;
+  const pr=peers.get(conn.peer),r=pr&&pr.rx;if(!r||r.id!==id)return;
+  if(r.got<r.size)await new Promise(res=>{r.ending=res;setTimeout(res,30000)});
+  if(pr.rx!==r)return;pr.rx=null;
   try{
     if(r.dir){flush(r);await r.chain;await r.w.close();r.saved='Saved to folder ✅'}
     else{
-      const url=URL.createObjectURL(new Blob(r.parts,{type:r.type||'application/octet-stream'}));
+      const url=URL.createObjectURL(new Blob(r.parts.sort((a,b)=>a.o-b.o).map(x=>x.d),{type:r.type||'application/octet-stream'}));
       const a=document.createElement('a');a.href=url;a.download=r.name;document.body.appendChild(a);a.click();a.remove();
       setTimeout(()=>URL.revokeObjectURL(url),60000);r.saved='Downloaded ✅';r.parts=[];
     }
@@ -274,28 +308,34 @@ function cancelSend(p,id){
 }
 async function sendOne(p,f,id){
   const s=tr[id];if(!s||s.cancelled)return;
-  const c=p.conn,dc=c.dataChannel;
-  const CH=Math.min(262144,c.peerConnection?.sctp?.maxMessageSize||65536);
-  dc.bufferedAmountLowThreshold=LOW;
+  const c=p.conn;
+  const lanes=()=>[c,...p.lanes].filter(x=>x.dataChannel&&x.dataChannel.readyState==='open');
+  const CH=Math.min(262144,c.peerConnection?.sctp?.maxMessageSize||65536)-HDR;
+  const n=Math.floor(Math.random()*4294967295);
   s.started=true;
   try{
-    c.send(JSON.stringify({t:'meta',id,name:f.name,size:f.size,type:f.type}));
+    c.send(JSON.stringify({t:'meta',id,n,name:f.name,size:f.size,type:f.type}));
     let off=0,next=f.size?f.slice(0,BLOCK).arrayBuffer():null;
     while(off<f.size){
       const buf=await next,end=off+buf.byteLength;
       next=end<f.size?f.slice(end,end+BLOCK).arrayBuffer():null;
       for(let o=0;o<buf.byteLength;o+=CH){
         if(s.cancelled)return;
-        if(dc.readyState!=='open')throw new Error('Disconnected');
-        if(dc.bufferedAmount>HIGH)await drain(dc);
-        if(s.cancelled)return;
-        const n=Math.min(CH,buf.byteLength-o);
-        c.send(new Uint8Array(buf,o,n));
-        upd(id,off+o+n,f.size);
+        let L=lanes();if(!L.length)throw new Error('Disconnected');
+        let best=L[0];for(const x of L)if(x.dataChannel.bufferedAmount<best.dataChannel.bufferedAmount)best=x;
+        const dc=best.dataChannel;
+        dc.bufferedAmountLowThreshold=LOW;
+        if(dc.bufferedAmount>HIGH){await drain(dc);if(s.cancelled)return}
+        const m=Math.min(CH,buf.byteLength-o);
+        const pkt=new Uint8Array(HDR+m);
+        const dv=new DataView(pkt.buffer);dv.setUint32(0,n);dv.setFloat64(4,off+o);
+        pkt.set(new Uint8Array(buf,o,m),HDR);
+        best.send(pkt);
+        upd(id,off+o+m,f.size);
       }
       off=end;
     }
-    while(dc.bufferedAmount>0&&!s.cancelled&&dc.readyState==='open')await sleep(20);
+    while(lanes().some(x=>x.dataChannel.bufferedAmount>0)&&!s.cancelled)await sleep(20);
     if(s.cancelled)return;
     c.send(JSON.stringify({t:'end',id}));
     upd(id,f.size,f.size,true);finish(id,'Sent ✅');
